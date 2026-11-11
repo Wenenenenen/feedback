@@ -149,10 +149,23 @@ def generate(
 
     return points
 
-def save(path, *args, **kwargs):
-    points = generate(*args, **kwargs)
-    if path.lower().endswith('.stl'):
+def save(path, sdf, *args, **kwargs):
+    # 导出专用参数，不传给 generate
+    default_color = kwargs.pop('default_color', None)
+    max_materials = kwargs.pop('max_materials', None)
+    points = generate(sdf, *args, **kwargs)
+    lower = path.lower()
+    if lower.endswith('.stl'):
         stl.write_binary_stl(path, points)
+    elif lower.endswith('.ply'):
+        from . import export
+        export.write_ply(path, sdf, points, default_color=default_color)
+    elif lower.endswith('.3mf'):
+        from . import export
+        kwargs = {}
+        if max_materials is not None:
+            kwargs['max_materials'] = max_materials
+        export.write_3mf(path, sdf, points, default_color=default_color, **kwargs)
     else:
         mesh = _mesh(points)
         mesh.write(path)

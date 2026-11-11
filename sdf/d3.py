@@ -3,6 +3,7 @@ import numpy as np
 # import operator
 
 from . import core, dn, d2, ease
+from . import color as _color
 
 # Constants
 
@@ -21,6 +22,8 @@ _ops = {}
 class SDF3:
     def __init__(self, f):
         self.f = f
+        # 颜色函数由各个操作在闭包上挂载，未上色时为 None
+        self._color = getattr(f, '_color', None)
     def __call__(self, p):
         return self.f(p).reshape((-1, 1))
     def __getattr__(self, name):
@@ -38,6 +41,21 @@ class SDF3:
     def k(self, k=None):
         self._k = k
         return self
+    def color(self, c):
+        """设置颜色并返回新对象（不修改原对象）。
+
+        支持 '#e63946' 十六进制、'yellow' 颜色名称、0-255 或 0-1 的
+        RGB 三元组，以及接收局部坐标点数组、返回 (N, 3) RGB 的函数
+        （用于程序化花纹，花纹会跟随后续的几何变换）。
+        """
+        new = SDF3(self.f)
+        if hasattr(self, '_k'):
+            new._k = self._k
+        new._color = _color.as_color_func(c)
+        return new
+    def colors_at(self, p, default_color=None):
+        """采样各点的 RGB 颜色（0-1），未上色的点使用默认颜色。"""
+        return _color.sample_colors(self, p, default_color)
     def generate(self, *args, **kwargs):
         return core.generate(self, *args, **kwargs)
     def save(self, path, *args, **kwargs):
@@ -330,6 +348,7 @@ def icosahedron(r):
 def translate(other, offset):
     def f(p):
         return other(p - offset)
+    f._color = _color.transformed(other, lambda p: p - offset)
     return f
 
 @op3
@@ -342,6 +361,7 @@ def scale(other, factor):
     m = min(x, min(y, z))
     def f(p):
         return other(p / s) * m
+    f._color = _color.transformed(other, lambda p: p / s)
     return f
 
 @op3
@@ -357,6 +377,7 @@ def rotate(other, angle, vector=Z):
     ]).T
     def f(p):
         return other(np.dot(p, matrix))
+    f._color = _color.transformed(other, lambda p: np.dot(p, matrix))
     return f
 
 @op3
@@ -389,12 +410,31 @@ def circular_array(other, count, offset=0):
         d1 = other(_vec(np.cos(a - da) * d, np.sin(a - da) * d, z))
         d2 = other(_vec(np.cos(a) * d, np.sin(a) * d, z))
         return _min(d1, d2)
+    c = getattr(other, '_color', None)
+    if c is not None:
+        def cf(p):
+            # 颜色取距离较近的那个扇区副本的颜色
+            x = p[:,0]
+            y = p[:,1]
+            z = p[:,2]
+            d = np.hypot(x, y)
+            a = np.arctan2(y, x) % da
+            q1 = _vec(np.cos(a - da) * d, np.sin(a - da) * d, z)
+            q2 = _vec(np.cos(a) * d, np.sin(a) * d, z)
+            d1 = other(q1)
+            d2 = other(q2)
+            w = (d1 <= d2).reshape((-1, 1))
+            return np.where(w, c(q1), c(q2))
+        f._color = cf
     return f
 
 # Alterations
 
 @op3
 def elongate(other, size):
+    def g(p):
+        # 与距离计算相同的坐标钳制
+        return _max(np.abs(p) - size, 0)
     def f(p):
         q = np.abs(p) - size
         x = q[:,0].reshape((-1, 1))
@@ -402,11 +442,13 @@ def elongate(other, size):
         z = q[:,2].reshape((-1, 1))
         w = _min(_max(x, _max(y, z)), 0)
         return other(_max(q, 0)) + w
+    f._color = _color.transformed(other, g)
     return f
 
 @op3
 def twist(other, k):
-    def f(p):
+    def g(p):
+        # 与距离计算相同的扭转坐标变换
         x = p[:,0]
         y = p[:,1]
         z = p[:,2]
@@ -415,12 +457,16 @@ def twist(other, k):
         x2 = c * x - s * y
         y2 = s * x + c * y
         z2 = z
-        return other(_vec(x2, y2, z2))
+        return _vec(x2, y2, z2)
+    def f(p):
+        return other(g(p))
+    f._color = _color.transformed(other, g)
     return f
 
 @op3
 def bend(other, k):
-    def f(p):
+    def g(p):
+        # 与距离计算相同的弯曲坐标变换
         x = p[:,0]
         y = p[:,1]
         z = p[:,2]
@@ -429,7 +475,10 @@ def bend(other, k):
         x2 = c * x - s * y
         y2 = s * x + c * y
         z2 = z
-        return other(_vec(x2, y2, z2))
+        return _vec(x2, y2, z2)
+    def f(p):
+        return other(g(p))
+    f._color = _color.transformed(other, g)
     return f
 
 @op3
@@ -438,22 +487,30 @@ def bend_linear(other, p0, p1, v, e=ease.linear):
     p1 = np.array(p1)
     v = -np.array(v)
     ab = p1 - p0
-    def f(p):
+    def g(p):
+        # 与距离计算相同的坐标变换
         t = np.clip(np.dot(p - p0, ab) / np.dot(ab, ab), 0, 1)
         t = e(t).reshape((-1, 1))
-        return other(p + t * v)
+        return p + t * v
+    def f(p):
+        return other(g(p))
+    f._color = _color.transformed(other, g)
     return f
 
 @op3
 def bend_radial(other, r0, r1, dz, e=ease.linear):
-    def f(p):
+    def g(p):
+        # 与距离计算相同的坐标变换
         x = p[:,0]
         y = p[:,1]
         z = p[:,2]
         r = np.hypot(x, y)
         t = np.clip((r - r0) / (r1 - r0), 0, 1)
         z = z - dz * e(t)
-        return other(_vec(x, y, z))
+        return _vec(x, y, z)
+    def f(p):
+        return other(g(p))
+    f._color = _color.transformed(other, g)
     return f
 
 @op3
@@ -467,6 +524,15 @@ def transition_linear(f0, f1, p0=-Z, p1=Z, e=ease.linear):
         t = np.clip(np.dot(p - p0, ab) / np.dot(ab, ab), 0, 1)
         t = e(t).reshape((-1, 1))
         return t * d2 + (1 - t) * d1
+    if _color.has_colors((f0, f1)):
+        def cf(p):
+            # 颜色按与距离相同的权重过渡
+            c1 = _color.child_colors(f0, p)
+            c2 = _color.child_colors(f1, p)
+            t = np.clip(np.dot(p - p0, ab) / np.dot(ab, ab), 0, 1)
+            t = e(t).reshape((-1, 1))
+            return _color.mix(c1, c2, t)
+        f._color = cf
     return f
 
 @op3
@@ -478,6 +544,16 @@ def transition_radial(f0, f1, r0=0, r1=1, e=ease.linear):
         t = np.clip((r - r0) / (r1 - r0), 0, 1)
         t = e(t).reshape((-1, 1))
         return t * d2 + (1 - t) * d1
+    if _color.has_colors((f0, f1)):
+        def cf(p):
+            # 颜色按与距离相同的权重过渡
+            c1 = _color.child_colors(f0, p)
+            c2 = _color.child_colors(f1, p)
+            r = np.hypot(p[:,0], p[:,1])
+            t = np.clip((r - r0) / (r1 - r0), 0, 1)
+            t = e(t).reshape((-1, 1))
+            return _color.mix(c1, c2, t)
+        f._color = cf
     return f
 
 @op3
@@ -487,7 +563,8 @@ def wrap_around(other, x0, x1, r=None, e=ease.linear):
     v = -Y
     if r is None:
         r = np.linalg.norm(p1 - p0) / (2 * np.pi)
-    def f(p):
+    def g(p):
+        # 与距离计算相同的卷曲坐标变换
         x = p[:,0]
         y = p[:,1]
         z = p[:,2]
@@ -498,7 +575,10 @@ def wrap_around(other, x0, x1, r=None, e=ease.linear):
         t = e(t).reshape((-1, 1))
         q = p0 + (p1 - p0) * t + v * d
         q[:,2] = z
-        return other(q)
+        return q
+    def f(p):
+        return other(g(p))
+    f._color = _color.transformed(other, g)
     return f
 
 # 3D => 2D Operations
@@ -517,6 +597,12 @@ def slice(other):
         w = A <= 0
         A[w] = B[w]
         return A
+    c = getattr(other, '_color', None)
+    if c is not None:
+        def cf(p):
+            # 截面颜色取 3D 物体在 z=0 平面处的颜色
+            return c(_vec(p[:,0], p[:,1], np.zeros(len(p))))
+        f._color = cf
     return f
 
 # Common

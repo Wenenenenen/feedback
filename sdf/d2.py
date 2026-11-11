@@ -3,6 +3,7 @@ import numpy as np
 import operator
 
 from . import dn, d3, ease
+from . import color as _color
 
 # Constants
 
@@ -20,6 +21,8 @@ _ops = {}
 class SDF2:
     def __init__(self, f):
         self.f = f
+        # 颜色函数由各个操作在闭包上挂载，未上色时为 None
+        self._color = getattr(f, '_color', None)
     def __call__(self, p):
         return self.f(p).reshape((-1, 1))
     def __getattr__(self, name):
@@ -36,6 +39,16 @@ class SDF2:
     def k(self, k=None):
         self._k = k
         return self
+    def color(self, c):
+        """设置颜色并返回新对象（不修改原对象）。用法同 SDF3.color。"""
+        new = SDF2(self.f)
+        if hasattr(self, '_k'):
+            new._k = self._k
+        new._color = _color.as_color_func(c)
+        return new
+    def colors_at(self, p, default_color=None):
+        """采样各点的 RGB 颜色（0-1），未上色的点使用默认颜色。"""
+        return _color.sample_colors(self, p, default_color)
 
 def sdf2(f):
     def wrapper(*args, **kwargs):
@@ -212,6 +225,7 @@ def vesica(r, d):
 def translate(other, offset):
     def f(p):
         return other(p - offset)
+    f._color = _color.transformed(other, lambda p: p - offset)
     return f
 
 @op2
@@ -224,6 +238,7 @@ def scale(other, factor):
     m = min(x, y)
     def f(p):
         return other(p / s) * m
+    f._color = _color.transformed(other, lambda p: p / s)
     return f
 
 @op2
@@ -237,6 +252,7 @@ def rotate(other, angle):
     ]).T
     def f(p):
         return other(np.dot(p, matrix))
+    f._color = _color.transformed(other, lambda p: np.dot(p, matrix))
     return f
 
 @op2
@@ -248,12 +264,16 @@ def circular_array(other, count):
 
 @op2
 def elongate(other, size):
+    def g(p):
+        # 与距离计算相同的坐标钳制
+        return _max(np.abs(p) - size, 0)
     def f(p):
         q = np.abs(p) - size
         x = q[:,0].reshape((-1, 1))
         y = q[:,1].reshape((-1, 1))
         w = _min(_max(x, y), 0)
         return other(_max(q, 0)) + w
+    f._color = _color.transformed(other, g)
     return f
 
 # 2D => 3D Operations
@@ -264,6 +284,7 @@ def extrude(other, h):
         d = other(p[:,[0,1]])
         w = _vec(d.reshape(-1), np.abs(p[:,2]) - h / 2)
         return _min(_max(w[:,0], w[:,1]), 0) + _length(_max(w, 0))
+    f._color = _color.transformed(other, lambda p: p[:,[0,1]])
     return f
 
 @op23
@@ -275,14 +296,26 @@ def extrude_to(a, b, h, e=ease.linear):
         d = d1 + (d2 - d1) * t.reshape((-1, 1))
         w = _vec(d.reshape(-1), np.abs(p[:,2]) - h / 2)
         return _min(_max(w[:,0], w[:,1]), 0) + _length(_max(w, 0))
+    if _color.has_colors((a, b)):
+        def cf(p):
+            # 颜色按与距离相同的权重沿 z 过渡
+            c1 = _color.child_colors(a, p[:,[0,1]])
+            c2 = _color.child_colors(b, p[:,[0,1]])
+            t = e(np.clip(p[:,2] / h, -0.5, 0.5) + 0.5)
+            t = t.reshape((-1, 1))
+            return _color.mix(c1, c2, t)
+        f._color = cf
     return f
 
 @op23
 def revolve(other, offset=0):
-    def f(p):
+    def g(p):
+        # 与距离计算相同的旋转截面坐标变换
         xy = p[:,[0,1]]
-        q = _vec(_length(xy) - offset, p[:,2])
-        return other(q)
+        return _vec(_length(xy) - offset, p[:,2])
+    def f(p):
+        return other(g(p))
+    f._color = _color.transformed(other, g)
     return f
 
 # Common

@@ -1,6 +1,8 @@
 import itertools
 import numpy as np
 
+from . import color as _color
+
 _min = np.minimum
 _max = np.maximum
 
@@ -17,6 +19,8 @@ def union(a, *bs, k=None):
                 m = d2 + (d1 - d2) * h
                 d1 = m - K * h * (1 - h)
         return d1
+    if _color.has_colors((a,) + bs):
+        f._color = _color.boolean_color('union', a, bs, k)
     return f
 
 def difference(a, *bs, k=None):
@@ -32,6 +36,8 @@ def difference(a, *bs, k=None):
                 m = d1 + (-d2 - d1) * h
                 d1 = m + K * h * (1 - h)
         return d1
+    if _color.has_colors((a,) + bs):
+        f._color = _color.boolean_color('difference', a, bs, k)
     return f
 
 def intersection(a, *bs, k=None):
@@ -47,6 +53,8 @@ def intersection(a, *bs, k=None):
                 m = d2 + (d1 - d2) * h
                 d1 = m + K * h * (1 - h)
         return d1
+    if _color.has_colors((a,) + bs):
+        f._color = _color.boolean_color('intersection', a, bs, k)
     return f
 
 def blend(a, *bs, k=0.5):
@@ -57,26 +65,32 @@ def blend(a, *bs, k=0.5):
             K = k or getattr(b, '_k', None)
             d1 = K * d2 + (1 - K) * d1
         return d1
+    if _color.has_colors((a,) + bs):
+        f._color = _color.blend_color(a, bs, k)
     return f
 
 def negate(other):
     def f(p):
         return -other(p)
+    f._color = getattr(other, '_color', None)
     return f
 
 def dilate(other, r):
     def f(p):
         return other(p) - r
+    f._color = getattr(other, '_color', None)
     return f
 
 def erode(other, r):
     def f(p):
         return other(p) + r
+    f._color = getattr(other, '_color', None)
     return f
 
 def shell(other, thickness):
     def f(p):
         return np.abs(other(p)) - thickness / 2
+    f._color = getattr(other, '_color', None)
     return f
 
 def repeat(other, spacing, count=None, padding=0):
@@ -111,4 +125,16 @@ def repeat(other, spacing, count=None, padding=0):
         for b in A[1:]:
             a = _min(a, b)
         return a
+
+    c = getattr(other, '_color', None)
+    if c is not None:
+        def cf(p):
+            # 颜色取最近重复单元的局部坐标处的值
+            q = np.divide(p, spacing, out=np.zeros_like(p), where=spacing != 0)
+            if count is None:
+                index = np.round(q)
+            else:
+                index = np.clip(np.round(q), -count, count)
+            return c(p - spacing * index)
+        f._color = cf
     return f

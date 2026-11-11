@@ -92,9 +92,87 @@ cp openvdb/openvdb/python/pyopenvdb.* `python -c 'import site; print(site.getsit
 
 ## File Formats
 
-`sdf` natively writes binary STL files. For other formats, [meshio](https://github.com/nschloe/meshio)
+`sdf` natively writes binary STL files. It also natively writes **PLY**（带顶点色）
+and **3MF**（多材质，供 Bambu Studio / PrusaSlicer 等多色切片软件使用）——
+详见下面的「颜色（多色打印）」章节。
+For other formats, [meshio](https://github.com/nschloe/meshio)
 is used (based on your output file extension). This adds support for over 20 different 3D file formats,
-including OBJ, PLY, VTK, and many more.
+including OBJ, VTK, and many more.
+
+## 颜色（多色打印）
+
+任何形状都可以用 `.color()` 上色，颜色会像几何一样跟随后续的
+`translate` / `rotate` / `twist` / `bend` / `wrap_around` 等所有变换，
+也会跟随 `extrude` / `revolve` 从 2D 带到 3D：
+
+```python
+f = sphere(1).color('#e63946') | box(1.5).color((40, 120, 200)).k(0.2)
+f -= cylinder(0.4).orient(X).color('yellow')
+f.save('out.3mf')
+```
+
+颜色支持以下几种写法：
+
+- `'#e63946'` 十六进制字符串
+- `'yellow'` 等颜色名称（matplotlib 颜色表）
+- `(40, 120, 200)` 0-255 的 RGB 三元组
+- `(0.1, 0.5, 0.9)` 0-1 的 RGB 三元组
+- 自定义函数：接收局部坐标点数组 `p`，返回 `(N, 3)` 的 RGB，
+  用于程序化花纹。花纹定义在局部坐标上，物体变换时花纹跟着走：
+
+```python
+import numpy as np
+
+def stripes(p):
+    # 沿局部 z 的条纹，twist 之后条纹会跟着一起扭
+    w = (np.sin(p[:, 2] * 6) > 0).reshape((-1, 1))
+    return np.where(w, (1.0, 1.0, 1.0), (0.1, 0.4, 0.9))
+
+f = box((0.7, 0.7, 2.5)).color(stripes).twist(0.8)
+```
+
+布尔运算的颜色规则符合直觉：
+
+- 并集 / 交集：表面是谁的就用谁的颜色
+- 差集：挖出的洞壁使用「刀具」（被减去的形状）的颜色；
+  刀具没上色时沿用被切物体的颜色
+- 带 `k` 的平滑融合：交界处颜色自然过渡为渐变
+- `blend` / `transition_*` / `repeat` / `circular_array` 等均正常携带颜色
+
+`image()` 会自动携带图片本身的颜色，可以直接做彩色 logo 铭牌：
+
+```python
+w, h = measure_image('logo.png')
+f = rounded_box((w * 1.1, h * 1.1, 0.1), 0.05).color((60, 60, 60))
+f |= image('logo.png').extrude(1) & slab(z0=0, z1=0.075)
+f.save('nameplate.3mf')
+```
+
+导出：
+
+- `f.save('out.ply')`：带顶点色的二进制 PLY，方便在 MeshLab / Blender 中预览
+- `f.save('out.3mf')`：每种颜色对应一个 basematerial，三角形按所在位置的
+  颜色归到最接近的材质；渐变色谱会自动量化，材质数量默认不超过 256 种
+  （可用 `max_materials=` 调整）
+- 未上色的部分使用默认颜色（浅灰），可用 `default_color=` 指定：
+
+```python
+f.save('out.3mf', default_color=(200, 200, 200), max_materials=16)
+```
+
+两个格式都会自动合并重复顶点（含批次边界的缝合点），导出封闭干净的网格。
+STL 导出行为与之前完全一致（逐字节相同）。完整示例见
+[examples/colored.py](examples/colored.py)。
+
+也可以用 `f.colors_at(points)` 直接采样任意点的 RGB（0-1）：
+
+```python
+colors = f.colors_at(np.array([[0, 0, 0], [1, 0, 0]]))
+```
+
+注意：极端参数的 `twist` / `bend` 会让距离场不再是合法 SDF，
+可能导致网格出现裂缝（这是 marching cubes 的固有限制，与颜色无关），
+建议扭转强度控制在 1 左右以内。
 
 ## Viewing the Mesh
 

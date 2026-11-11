@@ -61,10 +61,13 @@ def text(font_name, text, width=None, height=None, pixels=PIXELS, points=512):
 
 @d2.sdf2
 def image(thing, width=None, height=None, pixels=PIXELS):
-    im = _load_image(thing).convert('L')
-    return _sdf(width, height, pixels, 0, 0, im)
+    im = _load_image(thing)
+    # 保留一份 RGB 用于颜色采样，灰度图用于距离场
+    rgb = im.convert('RGB')
+    im = im.convert('L')
+    return _sdf(width, height, pixels, 0, 0, im, rgb)
 
-def _sdf(width, height, pixels, px, py, im):
+def _sdf(width, height, pixels, px, py, im, rgb=None):
     tw, th = im.size
 
     # downscale image if necessary
@@ -73,6 +76,8 @@ def _sdf(width, height, pixels, px, py, im):
         tw, th = int(round(tw * factor)), int(round(th * factor))
         px, py = int(round(px * factor)), int(round(py * factor))
         im = im.resize((tw, th))
+        if rgb is not None:
+            rgb = rgb.resize((tw, th))
 
     # convert to numpy array and apply distance transform
     im = im.convert('1')
@@ -127,6 +132,20 @@ def _sdf(width, height, pixels, px, py, im):
         d[outside] = q[outside]
         return d
 
+    if rgb is not None:
+        # 图片本身的颜色作为该形状的颜色（双线性采样）
+        rgba = np.asarray(rgb, dtype=float) / 255.0
+        def cf(p):
+            x = p[:,0]
+            y = p[:,1]
+            u = (x - x0) / (x1 - x0)
+            v = (y - y0) / (y1 - y0)
+            v = 1 - v
+            i = u * pw + px
+            j = v * ph + py
+            return _bilinear_interpolate_rgb(rgba, i, j)
+        f._color = cf
+
     return f
 
 def _bilinear_interpolate(a, x, y):
@@ -149,5 +168,25 @@ def _bilinear_interpolate(a, x, y):
     wb = (x1 - x) * (y - y0)
     wc = (x - x0) * (y1 - y)
     wd = (x - x0) * (y - y0)
+
+    return wa * pa + wb * pb + wc * pc + wd * pd
+
+def _bilinear_interpolate_rgb(a, x, y):
+    # 与 _bilinear_interpolate 相同的双线性插值，支持 (H, W, C) 多通道数组
+    # x0 限制在 [0, W-2]，保证边缘处权重正确
+    x0 = np.clip(np.floor(x).astype(int), 0, a.shape[1] - 2)
+    x1 = x0 + 1
+    y0 = np.clip(np.floor(y).astype(int), 0, a.shape[0] - 2)
+    y1 = y0 + 1
+
+    pa = a[y0, x0]
+    pb = a[y1, x0]
+    pc = a[y0, x1]
+    pd = a[y1, x1]
+
+    wa = ((x1 - x) * (y1 - y)).reshape((-1, 1))
+    wb = ((x1 - x) * (y - y0)).reshape((-1, 1))
+    wc = ((x - x0) * (y1 - y)).reshape((-1, 1))
+    wd = ((x - x0) * (y - y0)).reshape((-1, 1))
 
     return wa * pa + wb * pb + wc * pc + wd * pd
