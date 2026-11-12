@@ -1,7 +1,9 @@
 import functools
+import itertools
 import numpy as np
 import operator
 
+from . import color as _color
 from . import dn, d3, ease
 
 # Constants
@@ -18,8 +20,9 @@ UP = Y
 _ops = {}
 
 class SDF2:
-    def __init__(self, f):
+    def __init__(self, f, color_fn=None):
         self.f = f
+        self.color_fn = color_fn
     def __call__(self, p):
         return self.f(p).reshape((-1, 1))
     def __getattr__(self, name):
@@ -36,21 +39,39 @@ class SDF2:
     def k(self, k=None):
         self._k = k
         return self
+    def color(self, spec):
+        """Attach a constant or procedural color (see sdf.color for details)."""
+        return SDF2(self.f, _color.make_color_function(spec))
 
 def sdf2(f):
     def wrapper(*args, **kwargs):
-        return SDF2(f(*args, **kwargs))
+        result = f(*args, **kwargs)
+        if isinstance(result, SDF2):
+            return result
+        if isinstance(result, tuple):
+            return SDF2(result[0], result[1])
+        return SDF2(result)
     return wrapper
 
 def op2(f):
     def wrapper(*args, **kwargs):
-        return SDF2(f(*args, **kwargs))
+        result = f(*args, **kwargs)
+        if isinstance(result, SDF2):
+            return result
+        if isinstance(result, tuple):
+            return SDF2(result[0], result[1])
+        return SDF2(result)
     _ops[f.__name__] = wrapper
     return wrapper
 
 def op23(f):
     def wrapper(*args, **kwargs):
-        return d3.SDF3(f(*args, **kwargs))
+        result = f(*args, **kwargs)
+        if isinstance(result, d3.SDF3):
+            return result
+        if isinstance(result, tuple):
+            return d3.SDF3(result[0], result[1])
+        return d3.SDF3(result)
     _ops[f.__name__] = wrapper
     return wrapper
 
@@ -212,7 +233,9 @@ def vesica(r, d):
 def translate(other, offset):
     def f(p):
         return other(p - offset)
-    return f
+    def cf(p):
+        return _color.color_of(other, p - offset)
+    return f, cf
 
 @op2
 def scale(other, factor):
@@ -224,7 +247,9 @@ def scale(other, factor):
     m = min(x, y)
     def f(p):
         return other(p / s) * m
-    return f
+    def cf(p):
+        return _color.color_of(other, p / s)
+    return f, cf
 
 @op2
 def rotate(other, angle):
@@ -237,7 +262,9 @@ def rotate(other, angle):
     ]).T
     def f(p):
         return other(np.dot(p, matrix))
-    return f
+    def cf(p):
+        return _color.color_of(other, np.dot(p, matrix))
+    return f, cf
 
 @op2
 def circular_array(other, count):
@@ -254,7 +281,10 @@ def elongate(other, size):
         y = q[:,1].reshape((-1, 1))
         w = _min(_max(x, y), 0)
         return other(_max(q, 0)) + w
-    return f
+    def cf(p):
+        q = np.abs(p) - size
+        return _color.color_of(other, _max(q, 0))
+    return f, cf
 
 # 2D => 3D Operations
 
@@ -264,7 +294,9 @@ def extrude(other, h):
         d = other(p[:,[0,1]])
         w = _vec(d.reshape(-1), np.abs(p[:,2]) - h / 2)
         return _min(_max(w[:,0], w[:,1]), 0) + _length(_max(w, 0))
-    return f
+    def cf(p):
+        return _color.color_of(other, p[:,[0,1]])
+    return f, cf
 
 @op23
 def extrude_to(a, b, h, e=ease.linear):
@@ -275,7 +307,12 @@ def extrude_to(a, b, h, e=ease.linear):
         d = d1 + (d2 - d1) * t.reshape((-1, 1))
         w = _vec(d.reshape(-1), np.abs(p[:,2]) - h / 2)
         return _min(_max(w[:,0], w[:,1]), 0) + _length(_max(w, 0))
-    return f
+    def cf(p):
+        t = e(np.clip(p[:,2] / h, -0.5, 0.5) + 0.5).reshape((-1, 1))
+        return _color.nan_blend(
+            _color.color_of(a, p[:,[0,1]]),
+            _color.color_of(b, p[:,[0,1]]), t)
+    return f, cf
 
 @op23
 def revolve(other, offset=0):
@@ -283,16 +320,119 @@ def revolve(other, offset=0):
         xy = p[:,[0,1]]
         q = _vec(_length(xy) - offset, p[:,2])
         return other(q)
-    return f
+    def cf(p):
+        xy = p[:,[0,1]]
+        q = _vec(_length(xy) - offset, p[:,2])
+        return _color.color_of(other, q)
+    return f, cf
 
 # Common
 
-union = op2(dn.union)
-difference = op2(dn.difference)
-intersection = op2(dn.intersection)
-blend = op2(dn.blend)
-negate = op2(dn.negate)
-dilate = op2(dn.dilate)
-erode = op2(dn.erode)
-shell = op2(dn.shell)
-repeat = op2(dn.repeat)
+def _boolean(op_name, color_fn):
+    dn_fn = getattr(dn, op_name)
+    def op(a, *bs, k=None):
+        def f(p):
+            return dn_fn(a, *bs, k=k)(p)
+        def cf(p):
+            c = _color.color_of(a, p)
+            left = a
+            for b in bs:
+                c = color_fn(left, b, k)
+                if c is None:
+                    c = np.full((len(p), 4), np.nan)
+                else:
+                    c = c(p)
+                left = SDF2(left.f, lambda q, _c=c: _c)
+            return c
+        return SDF2(f, cf if _color.has_color(a) or
+                    any(_color.has_color(b) for b in bs) else None)
+    return op
+
+union = _boolean('union', _color.union_color)
+difference = _boolean('difference', _color.difference_color)
+intersection = _boolean('intersection', _color.intersection_color)
+
+def blend(a, *bs, k=0.5):
+    def f(p):
+        return dn.blend(a, *bs, k=k)(p)
+    def cf(p):
+        c = _color.color_of(a, p)
+        left = a
+        for b in bs:
+            K = k or getattr(b, '_k', None)
+            bc = _color.blend_color(left, b, K if K is not None else 0.5)
+            if bc is None:
+                c = _color.color_of(left, p)
+            else:
+                c = bc(p)
+            left = SDF2(left.f, lambda q, _c=c: _c)
+        return c
+    return SDF2(f, cf if _color.has_color(a) or
+                any(_color.has_color(b) for b in bs) else None)
+
+def negate(other):
+    return SDF2(dn.negate(other), _color.unary_color(other))
+
+def dilate(other, r):
+    return SDF2(dn.dilate(other, r), _color.unary_color(other))
+
+def erode(other, r):
+    return SDF2(dn.erode(other, r), _color.unary_color(other))
+
+def shell(other, thickness):
+    return SDF2(dn.shell(other, thickness), _color.unary_color(other))
+
+def repeat(other, spacing, count=None, padding=0):
+    f = dn.repeat(other, spacing, count, padding)
+    color_fn = None
+    if _color.has_color(other):
+        count_arr = np.array(count) if count is not None else None
+        spacing_arr = np.array(spacing)
+
+        def neighbors(dim, padding, spacing):
+            try:
+                padding = [padding[i] for i in range(dim)]
+            except Exception:
+                padding = [padding] * dim
+            try:
+                spacing = [spacing[i] for i in range(dim)]
+            except Exception:
+                spacing = [spacing] * dim
+            for i, s in enumerate(spacing):
+                if s == 0:
+                    padding[i] = 0
+            axes = [list(range(-p, p + 1)) for p in padding]
+            return list(itertools.product(*axes))
+
+        def indexes_for(p):
+            q = np.divide(
+                p, spacing_arr, out=np.zeros_like(p),
+                where=spacing_arr != 0)
+            if count_arr is None:
+                index = np.round(q)
+            else:
+                index = np.clip(np.round(q), -count_arr, count_arr)
+            return [index + n for n in
+                    neighbors(p.shape[-1], padding, spacing_arr)]
+
+        def color_fn(p):
+            indexes = indexes_for(p)
+            ds = [other(p - spacing_arr * i) for i in indexes]
+            cs = [_color.color_of(other, p - spacing_arr * i)
+                  for i in indexes]
+            d = ds[0]
+            c = cs[0]
+            for d2, c2 in zip(ds[1:], cs[1:]):
+                take = (d2 < d).reshape(-1)
+                c = _color.nan_select(take, c2, c)
+                d = _min(d, d2)
+            return c
+
+    return SDF2(f, color_fn)
+
+# attribute access (f.shell(...), f.repeat(...), ...) -- mirrors the
+# registration that op2() used to perform for the dn-backed operations.
+for _name in (
+        'union', 'difference', 'intersection', 'blend',
+        'negate', 'dilate', 'erode', 'shell', 'repeat'):
+    _ops[_name] = globals()[_name]

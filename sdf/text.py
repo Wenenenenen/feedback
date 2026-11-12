@@ -57,12 +57,39 @@ def text(font_name, text, width=None, height=None, pixels=PIXELS, points=512):
     draw = ImageDraw.Draw(im)
     draw.text((px - x0, py - y0), text, font=font, fill=255)
 
-    return _sdf(width, height, pixels, px, py, im)
+    f, _geo = _sdf(width, height, pixels, px, py, im)
+    return f
 
 @d2.sdf2
 def image(thing, width=None, height=None, pixels=PIXELS):
-    im = _load_image(thing).convert('L')
-    return _sdf(width, height, pixels, 0, 0, im)
+    im_gray = _load_image(thing).convert('L')
+    f, geo = _sdf(width, height, pixels, 0, 0, im_gray)
+
+    # carry the image's own RGBA colors, resampled to the *same* texture
+    # resolution and world bounds as the distance field so they never drift.
+    im_rgba = _load_image(thing).convert('RGBA')
+    im_rgba = im_rgba.resize((geo['tw'], geo['th']), resample=Image.BILINEAR)
+    rgba = np.asarray(im_rgba, dtype=float) / 255.0
+    x0, y0, x1, y1 = geo['x0'], geo['y0'], geo['x1'], geo['y1']
+    tw, th = geo['tw'], geo['th']
+    pw, ph, px, py = geo['pw'], geo['ph'], geo['px'], geo['py']
+
+    def color_fn(p):
+        x = p[:, 0]
+        y = p[:, 1]
+        u = (x - x0) / (x1 - x0)
+        v = 1 - (y - y0) / (y1 - y0)
+        # identical index mapping as the distance field
+        i = u * pw + px
+        j = v * ph + py
+        out = np.full((len(p), 4), np.nan)
+        inside = ((i >= 0) & (i <= tw - 1) & (j >= 0) & (j <= th - 1))
+        if np.any(inside):
+            out[inside] = _bilinear_interpolate_rgba(
+                rgba, i[inside], j[inside])
+        return out
+
+    return f, color_fn
 
 def _sdf(width, height, pixels, px, py, im):
     tw, th = im.size
@@ -127,6 +154,10 @@ def _sdf(width, height, pixels, px, py, im):
         d[outside] = q[outside]
         return d
 
+    geo = dict(tw=tw, th=th, px=px, py=py, pw=pw, ph=ph,
+               x0=x0, y0=y0, x1=x1, y1=y1, width=width, height=height)
+    return f, geo
+
     return f
 
 def _bilinear_interpolate(a, x, y):
@@ -151,3 +182,23 @@ def _bilinear_interpolate(a, x, y):
     wd = (x - x0) * (y - y0)
 
     return wa * pa + wb * pb + wc * pc + wd * pd
+
+def _bilinear_interpolate_rgba(a, x, y):
+    """Bilinear interpolation for an (h, w, 4) float texture."""
+    x0 = np.floor(x).astype(int)
+    x1 = x0 + 1
+    y0 = np.floor(y).astype(int)
+    y1 = y0 + 1
+
+    x0 = np.clip(x0, 0, a.shape[1] - 1)
+    x1 = np.clip(x1, 0, a.shape[1] - 1)
+    y0 = np.clip(y0, 0, a.shape[0] - 1)
+    y1 = np.clip(y1, 0, a.shape[0] - 1)
+
+    wa = ((x1 - x) * (y1 - y)).reshape(-1, 1)
+    wb = ((x1 - x) * (y - y0)).reshape(-1, 1)
+    wc = ((x - x0) * (y1 - y)).reshape(-1, 1)
+    wd = ((x - x0) * (y - y0)).reshape(-1, 1)
+
+    return (wa * a[y0, x0] + wb * a[y1, x0] +
+            wc * a[y0, x1] + wd * a[y1, x1])

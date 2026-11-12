@@ -17,6 +17,7 @@ from .text import (
 
 from .core import (
     generate,
+    generate_colored,
     save,
     sample_slice,
     show_slice,
@@ -24,4 +25,16 @@ from .core import (
 
 from .stl import (
     write_binary_stl,
+)
+
+from .color import (
+    parse_color,
+    NAMED_COLORS,
+    DEFAULT_COLOR,
+)
+
+from .export import (
+    write_ply,
+    write_3mf,
+    read_3mf,
 )

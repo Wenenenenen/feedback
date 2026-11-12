@@ -7,6 +7,7 @@ import itertools
 import numpy as np
 import time
 
+from . import color as _color
 from . import progress, stl
 
 WORKERS = multiprocessing.cpu_count()
@@ -59,6 +60,25 @@ def _worker(sdf, job, step, sparse):
     offset = np.array([X[0], Y[0], Z[0]])
     return points * scale + offset
 
+def _worker_colored(sdf, job, step, sparse):
+    """Same geometry as _worker, plus a per-vertex RGBA evaluation."""
+    X, Y, Z = job
+    if sparse and _skip(sdf, job):
+        return None
+    P = _cartesian_product(X, Y, Z)
+    shape = (len(X), len(Y), len(Z))
+    volume = sdf(P).reshape(shape)
+    try:
+        verts, faces, _, _ = measure.marching_cubes(volume, 0)
+    except Exception:
+        return []
+    scale = np.array([X[1] - X[0], Y[1] - Y[0], Z[1] - Z[0]])
+    offset = np.array([X[0], Y[0], Z[0]])
+    tri = verts[faces].reshape((-1, 3))
+    points = tri * scale + offset
+    colors = _color.color_of(sdf, points)
+    return points, colors
+
 def _estimate_bounds(sdf):
     # TODO: raise exception if bound estimation fails
     s = 16
@@ -81,14 +101,8 @@ def _estimate_bounds(sdf):
         x0, y0, z0 = (x0, y0, z0) + where.min(axis=0) * d - d / 2
     return ((x0, y0, z0), (x1, y1, z1))
 
-def generate(
-        sdf,
-        step=None, bounds=None, samples=SAMPLES,
-        workers=WORKERS, batch_size=BATCH_SIZE,
-        verbose=True, sparse=True):
-
-    start = time.time()
-
+def _prepare_batches(sdf, step, bounds, samples, verbose):
+    """Shared setup for generate / generate_colored."""
     if bounds is None:
         bounds = _estimate_bounds(sdf)
     (x0, y0, z0), (x1, y1, z1) = bounds
@@ -110,6 +124,19 @@ def generate(
     X = np.arange(x0, x1, dx)
     Y = np.arange(y0, y1, dy)
     Z = np.arange(z0, z1, dz)
+
+    return (dx, dy, dz), X, Y, Z
+
+def generate(
+        sdf,
+        step=None, bounds=None, samples=SAMPLES,
+        workers=WORKERS, batch_size=BATCH_SIZE,
+        verbose=True, sparse=True):
+
+    start = time.time()
+
+    (dx, dy, dz), X, Y, Z = _prepare_batches(
+        sdf, step, bounds, samples, verbose)
 
     s = batch_size
     Xs = [X[i:i+s+1] for i in range(0, len(X), s)]
@@ -149,11 +176,107 @@ def generate(
 
     return points
 
+def generate_colored(
+        sdf,
+        step=None, bounds=None, samples=SAMPLES,
+        workers=WORKERS, batch_size=BATCH_SIZE,
+        verbose=True, sparse=True, default_color=None):
+    """
+    Like generate(), but returns (points, colors).
+
+    ``points`` has exactly the same layout and values as generate() would
+    return (triangle vertices concatenated, (n*3, 3)). ``colors`` is an
+    (n*3, 4) float array in [0, 1]; uncolored regions are filled with
+    ``default_color`` (a configurable neutral gray by default).
+    """
+    start = time.time()
+
+    (dx, dy, dz), X, Y, Z = _prepare_batches(
+        sdf, step, bounds, samples, verbose)
+
+    s = batch_size
+    Xs = [X[i:i+s+1] for i in range(0, len(X), s)]
+    Ys = [Y[i:i+s+1] for i in range(0, len(Y), s)]
+    Zs = [Z[i:i+s+1] for i in range(0, len(Z), s)]
+
+    batches = list(itertools.product(Xs, Ys, Zs))
+    num_batches = len(batches)
+    num_samples = sum(len(xs) * len(ys) * len(zs)
+        for xs, ys, zs in batches)
+
+    if verbose:
+        print('%d samples in %d batches with %d workers' %
+            (num_samples, num_batches, workers))
+
+    points = []
+    colors = []
+    skipped = empty = nonempty = 0
+    bar = progress.Bar(num_batches, enabled=verbose)
+    pool = ThreadPool(workers)
+    f = partial(_worker_colored, sdf, step=(dx, dy, dz), sparse=sparse)
+    for result in pool.imap(f, batches):
+        bar.increment(1)
+        if result is None:
+            skipped += 1
+        elif len(result) == 0:
+            empty += 1
+        else:
+            nonempty += 1
+            pts, col = result
+            points.extend(pts)
+            colors.extend(col)
+    bar.done()
+
+    points = np.asarray(points, dtype=float).reshape((-1, 3))
+    colors = np.asarray(colors, dtype=float).reshape((-1, 4))
+
+    if default_color is None:
+        default_color = _color.DEFAULT_COLOR
+    default = np.array(
+        _color.parse_color(default_color), dtype=float)
+    missing = np.isnan(colors[:, 0])
+    if np.any(missing):
+        colors[missing] = default
+
+    if verbose:
+        print('%d skipped, %d empty, %d nonempty' % (skipped, empty, nonempty))
+        triangles = len(points) // 3
+        seconds = time.time() - start
+        print('%d triangles in %g seconds' % (triangles, seconds))
+
+    return points, colors
+
 def save(path, *args, **kwargs):
-    points = generate(*args, **kwargs)
-    if path.lower().endswith('.stl'):
+    default_color = kwargs.pop('default_color', None)
+    explicit_colored = kwargs.pop('colored', None)
+    sdf = args[0] if args else kwargs.get('sdf')
+    colored = (explicit_colored if explicit_colored is not None
+               else _color.has_color(sdf))
+    suffix = path.lower()
+    if suffix.endswith('.stl'):
+        # STL carries no color; geometry path is unchanged.
+        points = generate(*args, **kwargs)
         stl.write_binary_stl(path, points)
+    elif suffix.endswith('.3mf'):
+        # meshio cannot write 3MF, so the stdlib writer always handles it;
+        # an uncolored SDF (or explicit colored=False) gets the default color.
+        points, colors = generate_colored(
+            *args, default_color=default_color, **kwargs)
+        from . import export
+        export.write_3mf(path, points, colors)
+    elif suffix.endswith('.ply') and colored:
+        points, colors = generate_colored(
+            *args, default_color=default_color, **kwargs)
+        from . import export
+        export.write_ply(path, points, colors)
+    elif colored:
+        points, _ = generate_colored(
+            *args, default_color=default_color, **kwargs)
+        mesh = _mesh(points)
+        mesh.write(path)
     else:
+        # colorless path (meshio handles the format); preserves old behavior
+        points = generate(*args, **kwargs)
         mesh = _mesh(points)
         mesh.write(path)
 

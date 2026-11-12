@@ -34,10 +34,10 @@ in a 3D application.
 
 Have a cool example? Submit a PR!
 
-| [gearlike.py](examples/gearlike.py) | [knurling.py](examples/knurling.py) | [blobby.py](examples/blobby.py) | [weave.py](examples/weave.py) |
-| --- | --- | --- | --- |
-| ![gearlike](docs/images/gearlike.png) | ![knurling](docs/images/knurling.png) | ![blobby](docs/images/blobby.png) | ![weave](docs/images/weave.png) |
-| ![gearlike](docs/images/gearlike.jpg) | ![knurling](docs/images/knurling.jpg) | ![blobby](docs/images/blobby.jpg) | ![weave](docs/images/weave.jpg) |
+| [gearlike.py](examples/gearlike.py) | [knurling.py](examples/knurling.py) | [blobby.py](examples/blobby.py) | [weave.py](examples/weave.py) | [colored.py](examples/colored.py) |
+| --- | --- | --- | --- | --- |
+| ![gearlike](docs/images/gearlike.png) | ![knurling](docs/images/knurling.png) | ![blobby](docs/images/blobby.png) | ![weave](docs/images/weave.png) | vertex colors + 3MF materials |
+| ![gearlike](docs/images/gearlike.jpg) | ![knurling](docs/images/knurling.jpg) | ![blobby](docs/images/blobby.jpg) | ![weave](docs/images/weave.jpg) | smooth-blend gradients, image colors |
 
 ## Requirements
 
@@ -95,6 +95,94 @@ cp openvdb/openvdb/python/pyopenvdb.* `python -c 'import site; print(site.getsit
 `sdf` natively writes binary STL files. For other formats, [meshio](https://github.com/nschloe/meshio)
 is used (based on your output file extension). This adds support for over 20 different 3D file formats,
 including OBJ, PLY, VTK, and many more.
+
+## Color
+
+SDFs can carry colors that follow the geometry through every transform and
+boolean operation. Attach a color with `.color(...)` and save to `.ply`
+(vertex colors, handy for previewing) or `.3mf` (one material per color,
+ready for Bambu Studio / PrusaSlicer / Windows 3D Builder).
+
+```python
+from sdf import *
+
+f = sphere(1).color('#e63946') | box(1.5).color((40, 120, 200)).k(0.2)
+f -= cylinder(0.4).orient(X).color('yellow')
+f.save('out.3mf')
+f.save('out.ply')
+```
+
+### Color specifications
+
+`.color()` accepts any of these:
+
+- hex strings: `'#e63946'`, `'#fff'`, `'e63946'` (with or without `#`)
+- CSS4 color names: `'yellow'`, `'steelblue'`, ... (case-insensitive)
+- RGB(A) tuples in 0-1 floats: `(1.0, 0.2, 0.3)` — or 0-255 integers:
+  `(40, 120, 200)`. The range is detected automatically.
+- a function for procedural patterns. It receives the sample points in the
+  shape's **local** coordinates and returns per-point colors, so the pattern
+  is "baked onto" the object and follows `translate`, `rotate`, `twist`,
+  `bend`, `wrap_around` and every other transform:
+
+```python
+def stripes(p):
+    red   = np.array([1, 0, 0])
+    white = np.array([1, 1, 1])
+    return np.where((np.sin(p[:, 2] * 10) > 0)[:, None], red, white)
+
+f = cylinder(0.5).color(stripes).twist(2.0)
+```
+
+Colors on 2D shapes survive `extrude`, `extrude_to` and `revolve`, and
+`image(path)` carries the picture's own colors:
+
+```python
+logo = image('logo.png').extrude(0.1)   # colored picture -> solid badge
+```
+
+### Boolean color semantics
+
+- **union / intersection**: each surface keeps the color of the SDF that
+  defines it.
+- **difference**: the drilled hole wall takes the *cutter's* color; if the
+  cutter is uncolored, the base object's color is used.
+- **smooth blending (`.k()`)**: the blend zone becomes a smooth color
+  gradient instead of a hard color block. `blend` and `transition_*` mix
+  colors the same way they mix distances.
+- `repeat`, `circular_array`, `negate`, `shell`, `dilate`, `erode` all
+  propagate colors as well.
+
+### Default color and export details
+
+Any surface that was never assigned a color gets a neutral gray at export.
+Override it per save:
+
+```python
+f.save('out.3mf', default_color='#112233')
+```
+
+- **PLY** is written as binary little-endian with per-vertex `red/green/blue`
+  channels; coincident vertices (sharing a color) are merged, keeping the
+  mesh watertight.
+- **3MF** is written using only the Python standard library. Colors are
+  quantized to 5 bits per channel (visually lossless) and each distinct color
+  becomes a `<basematerials>` entry; triangles reference the nearest material,
+  so gradient regions produce a bounded set of materials rather than one per
+  vertex. Output passes the core/material XML namespaces and opens directly
+  in Bambu Studio, PrusaSlicer and Windows 3D Builder.
+
+To get the colors in code without writing a file, use `generate_colored()`,
+which returns `(points, rgba)` without changing `generate()`'s return value:
+
+```python
+points, colors = f.generate_colored(samples=2 ** 20)
+```
+
+Attaching colors never affects the geometry path: STL output and
+`generate()` results are byte-for-byte identical to the uncolored library,
+and uncolored meshing has no measurable overhead. A complete example is in
+[examples/colored.py](examples/colored.py).
 
 ## Viewing the Mesh
 
@@ -552,6 +640,10 @@ w, h = measure_image(IMAGE)
 f = rounded_box((w * 1.1, h * 1.1, 0.1), 0.05)
 f |= image(IMAGE).extrude(1) & slab(z0=0, z1=0.075)
 ```
+
+`image(...)` also carries the source picture's own RGBA colors, so saving
+the extrusion (or any transform of it) to `.ply` / `.3mf` produces a colored
+badge. See [examples/colored.py](examples/colored.py).
 
 ## Positioning
 
